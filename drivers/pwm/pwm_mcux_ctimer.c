@@ -149,6 +149,7 @@ static int mcux_ctimer_pwm_set_cycles(const struct device *dev, uint32_t pulse_c
 	const struct pwm_mcux_ctimer_config *config = dev->config;
 	struct pwm_mcux_ctimer_data *data = dev->data;
 	uint32_t period_channel = data->current_period_channel;
+	bool period_changed;
 	int ret = 0;
 	status_t status;
 
@@ -169,6 +170,8 @@ static int mcux_ctimer_pwm_set_cycles(const struct device *dev, uint32_t pulse_c
 		return ret;
 	}
 
+	period_changed = data->channel_states[period_channel].cycles != period_cycles;
+
 	if (flags & PWM_POLARITY_INVERTED) {
 		if (pulse_cycles == 0) {
 			/* make pulse cycles greater than period so event never occurs */
@@ -186,6 +189,22 @@ static int mcux_ctimer_pwm_set_cycles(const struct device *dev, uint32_t pulse_c
 	}
 	mcux_ctimer_pwm_update_state(data, pulse_channel, pulse_cycles, period_channel,
 				     period_cycles);
+
+	/*
+	 * A CTIMER match is an equality comparison, and only the period match
+	 * resets the counter. A counter that is already past the new period
+	 * value will therefore never match it again until it wraps at 2^32,
+	 * during which time the output produces no edges at all. Reset the
+	 * counter so that the new period takes effect on the next cycle rather
+	 * than up to 2^32 cycles later.
+	 *
+	 * Only on an actual period change: a period change already disturbs
+	 * every channel on this timer, whereas resetting on a duty-cycle change
+	 * would add a phase glitch that consumers do not expect.
+	 */
+	if (period_changed) {
+		CTIMER_Reset(config->base);
+	}
 
 	CTIMER_StartTimer(config->base);
 	return 0;
