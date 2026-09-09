@@ -10,10 +10,12 @@
 #include <esp_private/sar_periph_ctrl.h>
 #include <esp_private/adc_share_hw_ctrl.h>
 #include <esp_private/regi2c_ctrl.h>
+#include <hal/adc_ll.h>
 
 #include "adc_esp32.h"
 
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/irq.h>
 #include <esp_gpio_port.h>
 
 #include <zephyr/logging/log.h>
@@ -170,8 +172,46 @@ static int adc_esp32_read(const struct device *dev, const struct adc_sequence *s
 	}
 
 	adc_lock_acquire(data->hal.unit);
+
+	/*
+	 * Mirror ESP-IDF's adc_oneshot_read() around the conversion. Holding
+	 * the analog clock and bounding the DONE poll (added for Wi-Fi modem
+	 * power save) leaves two gaps open, either of which corrupts or stalls
+	 * reads once the modem starts gating clocks between beacons:
+	 *
+	 * - The C6's default PLL_F80M ADC source belongs to the modem domain,
+	 *   so keep an explicit vote for the configured (XTAL) source across
+	 *   the conversion as IDF does; ANALOG_CLOCK_ENABLE only holds the
+	 *   regi2c register-access leaf, not the selected source and not SAR
+	 *   power.
+	 *
+	 * - Setup, calibration and trigger share SAR control registers with
+	 *   the modem's own analog-block accesses. Running the whole sequence
+	 *   with interrupts locked keeps a modem interrupt from reprogramming
+	 *   the unit mid-conversion and handing back another channel's -- or
+	 *   a half-latched -- result with a success status.
+	 */
+	unsigned int ps_key = irq_lock();
+
+	if (esp_clk_tree_enable_src((soc_module_clk_t)data->hal.clk_src, true) != ESP_OK) {
+		irq_unlock(ps_key);
+		adc_lock_release(data->hal.unit);
+		return -EIO;
+	}
+
 	ANALOG_CLOCK_ENABLE();
 
+#if defined(CONFIG_SOC_SERIES_ESP32C6)
+	/*
+	 * Modem sleep can clear both PCR gates after device initialization.
+	 * A source-clock vote does not reopen them: setup writes are ignored
+	 * with the register gate closed, and conversion never completes with
+	 * the function gate closed. Restore both under the conversion lock,
+	 * before touching the ADC registers.
+	 */
+	adc_ll_enable_bus_clock(true);
+	adc_ll_enable_func_clock(true);
+#endif
 	adc_oneshot_hal_setup(&data->hal, channel_id);
 
 #if SOC_ADC_CALIBRATION_V1_SUPPORTED
@@ -181,6 +221,11 @@ static int adc_esp32_read(const struct device *dev, const struct adc_sequence *s
 	valid = adc_oneshot_hal_convert(&data->hal, &acq_raw);
 
 	ANALOG_CLOCK_DISABLE();
+
+	esp_clk_tree_enable_src((soc_module_clk_t)data->hal.clk_src, false);
+
+	irq_unlock(ps_key);
+
 	adc_lock_release(data->hal.unit);
 
 	if (!valid) {
@@ -368,7 +413,17 @@ static int adc_esp32_init(const struct device *dev)
 	struct adc_esp32_data *data = (struct adc_esp32_data *)dev->data;
 	const struct adc_esp32_conf *conf = (struct adc_esp32_conf *)dev->config;
 	uint32_t clock_src_hz;
-
+#if defined(CONFIG_SOC_SERIES_ESP32C6)
+	/*
+	 * The default PLL_F80M source belongs to the modem power domain and is
+	 * gated during Wi-Fi modem sleep, stalling conversions. XTAL stays
+	 * available while the modem sleeps. Other SoCs either lack an XTAL ADC
+	 * source or have not shown the failure, so keep their default.
+	 */
+	const soc_module_clk_t adc_clk_src = ADC_DIGI_CLK_SRC_XTAL;
+#else
+	const soc_module_clk_t adc_clk_src = ADC_DIGI_CLK_SRC_DEFAULT;
+#endif
 
 #if SOC_ADC_DIG_CTRL_SUPPORTED && (!SOC_ADC_RTC_CTRL_SUPPORTED || CONFIG_ADC_ESP32_DMA)
 	if (!device_is_ready(conf->clock_dev)) {
@@ -378,7 +433,7 @@ static int adc_esp32_init(const struct device *dev)
 	clock_control_on(conf->clock_dev, conf->clock_subsys);
 #endif
 
-	esp_clk_tree_src_get_freq_hz(ADC_DIGI_CLK_SRC_DEFAULT,
+	esp_clk_tree_src_get_freq_hz(adc_clk_src,
 				     ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &clock_src_hz);
 
 	if (!device_is_ready(conf->gpio_port) ||
@@ -397,7 +452,7 @@ static int adc_esp32_init(const struct device *dev)
 	adc_oneshot_hal_cfg_t config = {
 		.unit = conf->unit,
 		.work_mode = ADC_HAL_SINGLE_READ_MODE,
-		.clk_src = ADC_DIGI_CLK_SRC_DEFAULT,
+		.clk_src = adc_clk_src,
 		.clk_src_freq_hz = clock_src_hz,
 		.conv_timeout_us = CONFIG_ADC_ESP32_CONVERSION_TIMEOUT_US,
 	};
